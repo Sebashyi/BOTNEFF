@@ -1,195 +1,144 @@
 import os
 import json
 import logging
-import pickle
 import base64
 import re
-
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from flask import Flask, request
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# === Logging ===
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# ====== CONFIGURATION =======
-ADMIN_CHAT_ID = 1364549026  # replace with your Telegram ID
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-CREDENTIALS_FILE = 'credentials.json'
-TOKEN_FILE = 'token.pickle'
-USERS_FILE = 'users.json'
+# === Bot Token and Admin ===
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 1364549026  # Change if needed
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
+# === Load Users ===
+USERS_FILE = "users.json"
+if not os.path.exists(USERS_FILE):
+    with open(USERS_FILE, "w") as f:
+        json.dump({"pending": [], "approved": []}, f)
 
-# ============================
-
-# ---- Gmail Auth ----
-def get_gmail_credentials():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as token:
-            creds = pickle.load(token)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_FILE, SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, 'wb') as token:
-            pickle.dump(creds, token)
-    return creds
-
-def get_gmail_service():
-    creds = get_gmail_credentials()
-    return build('gmail', 'v1', credentials=creds)
-
-# ---- User Management ----
 def load_users():
-    if not os.path.exists(USERS_FILE):
-        return {"approved": [], "pending": []}
     with open(USERS_FILE, "r") as f:
         return json.load(f)
 
-def save_users(users):
+def save_users(data):
     with open(USERS_FILE, "w") as f:
-        json.dump(users, f)
+        json.dump(data, f, indent=2)
 
 def is_approved(chat_id):
-    users = load_users()
-    return chat_id in users["approved"]
+    return chat_id in load_users().get("approved", [])
 
-def add_pending_user(chat_id):
+# === Gmail Auth ===
+if "GMAIL_CREDENTIALS" not in os.environ:
+    raise Exception("Missing GMAIL_CREDENTIALS secret.")
+creds_dict = json.loads(os.environ["GMAIL_CREDENTIALS"])
+creds = Credentials.from_authorized_user_info(creds_dict)
+service = build("gmail", "v1", credentials=creds)
+
+# === Gmail Helpers ===
+def extract_reset_link_and_code(msg_body):
+    links = re.findall(r'https://www\.netflix\.com/[^\s"<]+', msg_body)
+    codes = re.findall(r'(?<!\d)(\d{6})(?!\d)', msg_body)
+    return links[0] if links else "No reset link found", codes[0] if codes else "No code found"
+
+def fetch_latest_email(email, query):
+    result = service.users().messages().list(userId='me', q=f'to:{email} {query}', maxResults=1).execute()
+    messages = result.get('messages', [])
+    if not messages:
+        return "No email found."
+    msg = service.users().messages().get(userId='me', id=messages[0]['id'], format='full').execute()
+    parts = msg['payload'].get('parts', [])
+    body = ""
+    for part in parts:
+        if part['mimeType'] == 'text/plain':
+            body = base64.urlsafe_b64decode(part['body']['data']).decode()
+            break
+    return extract_reset_link_and_code(body)
+
+# === Handlers ===
+def start(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
     users = load_users()
-    if chat_id not in users["pending"] and chat_id not in users["approved"]:
+    if chat_id in users["approved"]:
+        update.message.reply_text("✅ You are already approved. Use /get_code or /get_reset <email>")
+    elif chat_id in users["pending"]:
+        update.message.reply_text("⏳ You have already requested access. Please wait.")
+    else:
         users["pending"].append(chat_id)
         save_users(users)
-        return True
-    return False
+        update.message.reply_text("✅ Request received. Waiting for admin approval.")
+        context.bot.send_message(chat_id=ADMIN_ID, text=f"👤 New user requested access:\nID: {chat_id}")
 
-def approve_user(chat_id):
+def approve(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        update.message.reply_text("Usage: /approve <chat_id>")
+        return
+    chat_id = int(args[0])
     users = load_users()
     if chat_id in users["pending"]:
         users["pending"].remove(chat_id)
-    if chat_id not in users["approved"]:
         users["approved"].append(chat_id)
-    save_users(users)
-
-def get_latest_email(service, user_id='me', query='from:info@mailer.netflix.com'):
-    results = service.users().messages().list(userId=user_id, q=query, maxResults=1).execute()
-    messages = results.get('messages', [])
-    if not messages:
-        return None
-
-    msg = service.users().messages().get(userId=user_id, id=messages[0]['id'], format='full').execute()
-    parts = msg['payload'].get('parts', [])
-    body = ""
-
-    for part in parts:
-        if part['mimeType'] == 'text/html':
-            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-            break
-    return body
-
-def extract_reset_link(body):
-    match = re.search(r'href="(https://www\.netflix\.com/[^\"]*password[^\"]*)"', body)
-    return match.group(1) if match else "Reset link not found."
-
-def extract_code(body):
-    match = re.search(r'(\d{6})', body)
-    return match.group(1) if match else "No code found."
-
-# ---- Bot Handlers ----
-def start(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_added = add_pending_user(chat_id)
-    context.bot.send_message(chat_id, "👋 Welcome! Your ID has been sent to the admin for approval.")
-    if user_added:
-        context.bot.send_message(ADMIN_CHAT_ID, f"New user requested access:\nChat ID: {chat_id}")
-
-def get_reset(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    if not is_approved(chat_id):
-        update.message.reply_text("⛔ You are not approved yet.")
-        return
-
-    try:
-        service = get_gmail_service()
-        body = get_latest_email(service)
-        if not body:
-            update.message.reply_text("No email found.")
-            return
-
-        link = extract_reset_link(body)
-        update.message.reply_text(f"🔗 Reset link:\n{link}")
-    except Exception as e:
-        update.message.reply_text("Error fetching reset link.")
-        logger.error(e)
+        save_users(users)
+        update.message.reply_text("✅ User approved.")
+        context.bot.send_message(chat_id=chat_id, text="✅ You have been approved. Use /get_code or /get_reset <email>")
+    else:
+        update.message.reply_text("❌ User not found in pending list.")
 
 def get_code(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    if not is_approved(chat_id):
-        update.message.reply_text("⛔ You are not approved yet.")
+    if not is_approved(update.effective_chat.id):
+        update.message.reply_text("❌ Not approved.")
         return
-
-    try:
-        service = get_gmail_service()
-        body = get_latest_email(service)
-        if not body:
-            update.message.reply_text("No email found.")
-            return
-
-        code = extract_code(body)
-        update.message.reply_text(f"🔢 Login code: {code}")
-    except Exception as e:
-        update.message.reply_text("Error fetching code.")
-        logger.error(e)
-
-def approve(update: Update, context: CallbackContext):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        update.message.reply_text("⛔ Unauthorized.")
+    if not context.args:
+        update.message.reply_text("Usage: /get_code <email>")
         return
-    try:
-        chat_id = int(context.args[0])
-        approve_user(chat_id)
-        update.message.reply_text(f"✅ Approved user {chat_id}")
-    except:
-        update.message.reply_text("Usage: /approve <chat_id>")
+    email = context.args[0]
+    link, code = fetch_latest_email(email, "Netflix")
+    update.message.reply_text(f"🔐 Sign-in code: {code}\n🔗 Reset link (if any): {link}")
 
-def pending(update: Update, context: CallbackContext):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        update.message.reply_text("⛔ Unauthorized.")
+def get_reset(update: Update, context: CallbackContext):
+    if not is_approved(update.effective_chat.id):
+        update.message.reply_text("❌ Not approved.")
         return
-    users = load_users()
-    update.message.reply_text(f"📌 Pending Users:\n" + "\n".join(map(str, users["pending"])))
+    if not context.args:
+        update.message.reply_text("Usage: /get_reset <email>")
+        return
+    email = context.args[0]
+    link, code = fetch_latest_email(email, "Netflix password reset")
+    update.message.reply_text(f"🔗 Reset link: {link}\n🔐 Code (if any): {code}")
 
-# ---- Main Entry ----
-def main():
-    if not BOT_TOKEN:
-        raise Exception("Missing BOT_TOKEN environment variable.")
-    if not os.path.exists(CREDENTIALS_FILE):
-        raise Exception("Missing credentials.json file.")
-    
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+# === Flask App for Webhook ===
+app = Flask(__name__)
+updater = Updater(TOKEN, use_context=True)
+dispatcher = updater.dispatcher
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("getreset", get_reset))
-    dp.add_handler(CommandHandler("getcode", get_code))
-    dp.add_handler(CommandHandler("approve", approve, pass_args=True))
-    dp.add_handler(CommandHandler("pending", pending))
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("approve", approve))
+dispatcher.add_handler(CommandHandler("get_code", get_code))
+dispatcher.add_handler(CommandHandler("get_reset", get_reset))
 
-    updater.start_polling()
-    updater.idle()
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), updater.bot)
+    dispatcher.process_update(update)
+    return "ok"
 
-if __name__ == '__main__':
-    main()
+@app.route("/")
+def home():
+    return "Bot is running with webhook!"
 
+if __name__ == "__main__":
+    PORT = int(os.environ.get("PORT", 5000))
+    HOST = "0.0.0.0"
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., https://yourservice.onrender.com
+    if not WEBHOOK_URL:
+        raise Exception("Missing WEBHOOK_URL in environment.")
+    updater.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    app.run(host=HOST, port=PORT)
