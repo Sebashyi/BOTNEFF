@@ -172,14 +172,15 @@ def force_webhook():
     except Exception as e:
         return f"❌ Failed to set webhook: {e}", 500
 
-# === Startup Hook ===
+# === Start Server + Webhook ===
 if __name__ == "__main__":
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         raise Exception("Missing WEBHOOK_URL")
 
-    bot.set_webhook(f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # 🔧 Sets webhook URL exactly once
+    full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}"
+    print(f"🔗 Setting webhook to: {full_webhook_url}")
+    bot.set_webhook(full_webhook_url)
 
-
-
+   
