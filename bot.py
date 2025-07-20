@@ -151,37 +151,21 @@ dispatcher.add_handler(CommandHandler("get_code", get_code))
 dispatcher.add_handler(CommandHandler("get_reset", get_reset))
 
 # === Webhook Routes ===
-
-# ✅ Telegram update handler (REQUIRED)
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
 
-# ✅ Webhook setter route (for /force_webhook)
-@app.route("/force_webhook", methods=["GET"])
-def force_webhook():
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    if not WEBHOOK_URL:
-        return "❌ Missing WEBHOOK_URL", 500
-    try:
-        bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-        return f"✅ Webhook set to {WEBHOOK_URL}/{TOKEN}", 200
-    except Exception as e:
-        return f"❌ Failed to set webhook: {e}", 500
-
-# ✅ Startup block
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running."
 if __name__ == "__main__":
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         raise Exception("Missing WEBHOOK_URL")
+    bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")  # ✅ only once
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
-if __name__ == "__main__":
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    if not WEBHOOK_URL:
-        raise Exception("Missing WEBHOOK_URL")
-    bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
