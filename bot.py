@@ -3,171 +3,179 @@ import json
 import base64
 import logging
 import re
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
-
-load_dotenv()
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
+from bs4 import BeautifulSoup
 
 # Logging
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ENV variables
+# Admin ID (replace with your Telegram ID)
+ADMIN_ID = 1364549026
+
+# Load credentials from environment secret (base64-encoded JSON)
+credentials_json = os.getenv("GMAIL_CREDENTIALS")
+if not credentials_json:
+    raise Exception("Missing GMAIL_CREDENTIALS secret.")
+
+info = json.loads(credentials_json)
+creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/gmail.readonly"])
+
+# Gmail API service
+service = build("gmail", "v1", credentials=creds)
+
+# Telegram Bot Token
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
+if not BOT_TOKEN:
+    raise Exception("Missing BOT_TOKEN environment variable.")
 
-# Gmail credentials
-with open("credentials.json", "r") as f:
-    creds_dict = json.load(f)
+# User storage file
+USERS_FILE = "users.json"
 
-creds = Credentials.from_service_account_info(
-    creds_dict,
-    scopes=["https://www.googleapis.com/auth/gmail.readonly"]
-)
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("approved", []), data.get("pending", [])
+    else:
+        return [], []
 
-gmail_service = build('gmail', 'v1', credentials=creds)
+def save_users(approved_users, pending_users):
+    data = {"approved": approved_users, "pending": pending_users}
+    with open(USERS_FILE, "w") as f:
+        json.dump(data, f)
 
+approved_users, pending_users = load_users()
 
-# Helper: extract reset link
-def extract_reset_link_from_html(html):
-    matches = re.findall(r'https://www\.netflix\.com/[^\s">]+password[^\s">]+', html)
-    return matches[0] if matches else None
+def is_approved(chat_id):
+    return chat_id in approved_users
 
-# Helper: extract Netflix sign-in code
-def extract_signin_code(text):
-    match = re.search(r'(?i)Netflix.*?code.*?(\d{6})', text)
-    return match.group(1) if match else None
-
-
-# Fetch Netflix reset link
-def get_latest_reset_link():
+def get_latest_email(user_email, query):
     try:
-        results = gmail_service.users().messages().list(
-            userId='me',
-            q="subject:reset netflix newer_than:2d",
-            maxResults=5
-        ).execute()
+        results = service.users().messages().list(userId=user_email, q=query, maxResults=1).execute()
+        messages = results.get("messages", [])
+        if not messages:
+            return "No matching email found."
 
-        messages = results.get('messages', [])
+        msg = service.users().messages().get(userId=user_email, id=messages[0]["id"]).execute()
+        payload = msg.get("payload", {})
+        parts = payload.get("parts", [])
 
-        for msg in messages:
-            msg_data = gmail_service.users().messages().get(
-                userId='me',
-                id=msg['id'],
-                format='full'
-            ).execute()
+        for part in parts:
+            if part.get("mimeType") == "text/html":
+                data = part["body"]["data"]
+                decoded = base64.urlsafe_b64decode(data).decode("utf-8")
+                soup = BeautifulSoup(decoded, "html.parser")
 
-            payload = msg_data.get('payload', {})
-            parts = payload.get('parts', [])
-            data = ""
+                if "password" in query:
+                    for link in soup.find_all("a", href=True):
+                        if "netflix.com/password" in link["href"]:
+                            return link["href"]
+                else:
+                    match = re.search(r">(\d{6})<", decoded)
+                    if match:
+                        return f"Netflix Sign-In Code: {match.group(1)}"
+        return "Matching email found but no data extracted."
 
-            for part in parts:
-                if part['mimeType'] == 'text/html':
-                    data = part['body'].get('data')
-                    break
-                elif part['mimeType'] == 'text/plain' and not data:
-                    data = part['body'].get('data')
-
-            if data:
-                decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-                link = extract_reset_link_from_html(decoded)
-                if link:
-                    return link
-        return None
     except Exception as e:
-        logging.error(f"Error fetching reset email: {e}")
-        return None
+        logger.error(f"Error fetching email: {e}")
+        return "Error fetching email."
 
-
-# Fetch Netflix login code
-def get_latest_signin_code():
-    try:
-        results = gmail_service.users().messages().list(
-            userId='me',
-            q="subject:code netflix newer_than:2d",
-            maxResults=5
-        ).execute()
-
-        messages = results.get('messages', [])
-
-        for msg in messages:
-            msg_data = gmail_service.users().messages().get(
-                userId='me',
-                id=msg['id'],
-                format='full'
-            ).execute()
-
-            payload = msg_data.get('payload', {})
-            parts = payload.get('parts', [])
-            data = ""
-
-            for part in parts:
-                if part['mimeType'] == 'text/plain':
-                    data = part['body'].get('data')
-                    break
-                elif part['mimeType'] == 'text/html' and not data:
-                    data = part['body'].get('data')
-
-            if data:
-                decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-                code = extract_signin_code(decoded)
-                if code:
-                    return code
-        return None
-    except Exception as e:
-        logging.error(f"Error fetching code email: {e}")
-        return None
-
-
-# Commands
 def start(update: Update, context: CallbackContext):
-    user = update.effective_user
     chat_id = update.effective_chat.id
-    name = user.full_name
-    update.message.reply_text(f"👋 Welcome {name}!\n\nUse /reset to get a Netflix reset link or /code for sign-in code.")
+    user = update.effective_user
 
-    if ADMIN_ID:
-        try:
-            context.bot.send_message(chat_id=int(ADMIN_ID), text=f"🟢 New user:\n👤 {name}\n🆔 {chat_id}")
-        except Exception as e:
-            logging.error(f"Admin notification failed: {e}")
+    if chat_id in approved_users:
+        update.message.reply_text("✅ You are already approved.")
+    elif chat_id in pending_users:
+        update.message.reply_text("⏳ Your request is pending admin approval.")
+    else:
+        pending_users.append(chat_id)
+        save_users(approved_users, pending_users)
+        update.message.reply_text("👋 Welcome! Request sent for approval. Please wait.")
+        context.bot.send_message(chat_id=ADMIN_ID, text=f"New user requested access: {chat_id} (@{user.username})")
 
+def approve(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        update.message.reply_text("Usage: /approve <chat_id>")
+        return
+
+    try:
+        chat_id = int(context.args[0])
+        if chat_id not in approved_users:
+            approved_users.append(chat_id)
+        if chat_id in pending_users:
+            pending_users.remove(chat_id)
+        save_users(approved_users, pending_users)
+        context.bot.send_message(chat_id=chat_id, text="✅ You are approved to use the bot!")
+        update.message.reply_text("User approved.")
+    except ValueError:
+        update.message.reply_text("Invalid chat_id.")
+
+def revoke(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        update.message.reply_text("Usage: /revoke <chat_id>")
+        return
+
+    try:
+        chat_id = int(context.args[0])
+        if chat_id in approved_users:
+            approved_users.remove(chat_id)
+        save_users(approved_users, pending_users)
+        context.bot.send_message(chat_id=chat_id, text="🚫 Access revoked by admin.")
+        update.message.reply_text("User revoked.")
+    except ValueError:
+        update.message.reply_text("Invalid chat_id.")
+
+def fetch(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    if not is_approved(chat_id):
+        update.message.reply_text("❌ You are not approved to use this bot.")
+        return
+
+    if not context.args:
+        update.message.reply_text("Usage: /fetch <email>")
+        return
+
+    email = context.args[0]
+    code = get_latest_email(email, "Netflix login code")
+    update.message.reply_text(code)
 
 def reset(update: Update, context: CallbackContext):
-    update.message.reply_text("🔍 Searching for Netflix reset email...")
-    link = get_latest_reset_link()
-    if link:
-        update.message.reply_text(f"🔗 Netflix Reset Link:\n{link}")
-    else:
-        update.message.reply_text("❌ No recent Netflix reset link found.")
+    chat_id = update.effective_chat.id
+    if not is_approved(chat_id):
+        update.message.reply_text("❌ You are not approved to use this bot.")
+        return
 
+    if not context.args:
+        update.message.reply_text("Usage: /reset <email>")
+        return
 
-def code(update: Update, context: CallbackContext):
-    update.message.reply_text("📩 Checking for latest Netflix sign-in code...")
-    code = get_latest_signin_code()
-    if code:
-        update.message.reply_text(f"✅ Your Netflix code is: `{code}`", parse_mode="Markdown")
-    else:
-        update.message.reply_text("❌ No Netflix code found in recent emails.")
+    email = context.args[0]
+    link = get_latest_email(email, "Netflix password reset")
+    update.message.reply_text(link)
 
-
-# Main entry
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN not found in environment.")
-
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("approve", approve))
+    dp.add_handler(CommandHandler("revoke", revoke))
+    dp.add_handler(CommandHandler("fetch", fetch))
     dp.add_handler(CommandHandler("reset", reset))
-    dp.add_handler(CommandHandler("code", code))
 
     updater.start_polling()
     updater.idle()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
