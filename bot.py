@@ -3,18 +3,18 @@ import json
 import logging
 import base64
 import re
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from flask import Flask, request
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, CallbackContext
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from flask import Flask, request
 
 # === Logging ===
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # === Bot Token and Admin ===
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 1364549026  # Change if needed
+ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "1364549026"))
 
 # === Load Users ===
 USERS_FILE = "users.json"
@@ -40,7 +40,6 @@ creds_dict = json.loads(os.environ["GMAIL_CREDENTIALS"])
 creds = Credentials.from_authorized_user_info(creds_dict)
 service = build("gmail", "v1", credentials=creds)
 
-# === Gmail Helpers ===
 def extract_reset_link_and_code(msg_body):
     links = re.findall(r'https://www\.netflix\.com/[^\s"<]+', msg_body)
     codes = re.findall(r'(?<!\d)(\d{6})(?!\d)', msg_body)
@@ -50,7 +49,7 @@ def fetch_latest_email(email, query):
     result = service.users().messages().list(userId='me', q=f'to:{email} {query}', maxResults=1).execute()
     messages = result.get('messages', [])
     if not messages:
-        return "No email found."
+        return "No email found.", "N/A"
     msg = service.users().messages().get(userId='me', id=messages[0]['id'], format='full').execute()
     parts = msg['payload'].get('parts', [])
     body = ""
@@ -60,7 +59,11 @@ def fetch_latest_email(email, query):
             break
     return extract_reset_link_and_code(body)
 
-# === Handlers ===
+# === Bot Logic ===
+bot = Bot(TOKEN)
+app = Flask(__name__)
+dispatcher = Dispatcher(bot, None, use_context=True)
+
 def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     users = load_users()
@@ -114,31 +117,25 @@ def get_reset(update: Update, context: CallbackContext):
     link, code = fetch_latest_email(email, "Netflix password reset")
     update.message.reply_text(f"🔗 Reset link: {link}\n🔐 Code (if any): {code}")
 
-# === Flask App for Webhook ===
-app = Flask(__name__)
-updater = Updater(TOKEN, use_context=True)
-dispatcher = updater.dispatcher
-
+# === Register Handlers ===
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("approve", approve))
 dispatcher.add_handler(CommandHandler("get_code", get_code))
 dispatcher.add_handler(CommandHandler("get_reset", get_reset))
 
-@app.route(f"/{TOKEN}", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), updater.bot)
+    update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
 
-@app.route("/")
-def home():
-    return "Bot is running with webhook!"
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running with webhook"
 
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5000))
-    HOST = "0.0.0.0"
-    WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., https://yourservice.onrender.com
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
-        raise Exception("Missing WEBHOOK_URL in environment.")
-    updater.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    app.run(host=HOST, port=PORT)
+        raise Exception("Missing WEBHOOK_URL")
+    bot.set_webhook(WEBHOOK_URL + "/webhook")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
