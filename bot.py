@@ -33,13 +33,17 @@ def save_users(data):
 def is_approved(chat_id):
     return chat_id in load_users().get("approved", [])
 
-# === Gmail Auth ===
-if "GMAIL_CREDENTIALS" not in os.environ:
+# === Gmail Auth (read secret file directly from Render path) ===
+if not os.path.exists("/etc/secrets/GMAIL_CREDENTIALS"):
     raise Exception("Missing GMAIL_CREDENTIALS secret.")
-creds_dict = json.loads(os.environ["GMAIL_CREDENTIALS"])
+
+with open("/etc/secrets/GMAIL_CREDENTIALS", "r") as f:
+    creds_dict = json.load(f)
+
 creds = Credentials.from_authorized_user_info(creds_dict)
 service = build("gmail", "v1", credentials=creds)
 
+# === Gmail Helpers ===
 def extract_reset_link_and_code(msg_body):
     links = re.findall(r'https://www\.netflix\.com/[^\s"<]+', msg_body)
     codes = re.findall(r'(?<!\d)(\d{6})(?!\d)', msg_body)
@@ -59,11 +63,12 @@ def fetch_latest_email(email, query):
             break
     return extract_reset_link_and_code(body)
 
-# === Bot Logic ===
+# === Flask + Telegram Webhook Setup ===
 bot = Bot(TOKEN)
 app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
+# === Handlers ===
 def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     users = load_users()
@@ -91,7 +96,7 @@ def approve(update: Update, context: CallbackContext):
         users["approved"].append(chat_id)
         save_users(users)
         update.message.reply_text("✅ User approved.")
-        context.bot.send_message(chat_id=chat_id, text="✅ You have been approved. Use /get_code or /get_reset <email>")
+        context.bot.send_message(chat_id=chat_id, text="✅ You have been approved. You can now use /get_code or /get_reset <email>")
     else:
         update.message.reply_text("❌ User not found in pending list.")
 
@@ -123,7 +128,8 @@ dispatcher.add_handler(CommandHandler("approve", approve))
 dispatcher.add_handler(CommandHandler("get_code", get_code))
 dispatcher.add_handler(CommandHandler("get_reset", get_reset))
 
-@app.route("/webhook", methods=["POST"])
+# === Flask Webhook Routes ===
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
@@ -137,5 +143,5 @@ if __name__ == "__main__":
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         raise Exception("Missing WEBHOOK_URL")
-    bot.set_webhook(WEBHOOK_URL + "/webhook")
+    bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
