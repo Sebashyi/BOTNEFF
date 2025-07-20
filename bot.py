@@ -60,7 +60,7 @@ def fetch_latest_email(email, query, digits=4):
     body = ""
     if 'parts' in payload:
         for part in payload['parts']:
-            if part.get('mimeType') == 'text/plain':
+            if part.get('mimeType') == 'text/plain' and 'data' in part['body']:
                 body = base64.urlsafe_b64decode(part['body']['data']).decode()
                 break
     elif 'body' in payload and 'data' in payload['body']:
@@ -73,7 +73,7 @@ bot = Bot(TOKEN)
 app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# === Handlers ===
+# === Telegram Handlers ===
 def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     users = load_users()
@@ -143,29 +143,44 @@ def get_reset(update: Update, context: CallbackContext):
     link, code = fetch_latest_email(email, "Netflix password reset", digits=6)
     update.message.reply_text(f"🔗 Reset link: {link}\n🔐 Code (if any): {code}")
 
-# === Telegram Command Routing ===
+# === Register Telegram Handlers ===
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("approve", approve))
 dispatcher.add_handler(CommandHandler("revoke", revoke))
 dispatcher.add_handler(CommandHandler("get_code", get_code))
 dispatcher.add_handler(CommandHandler("get_reset", get_reset))
 
-# === Webhook Routes ===
+# === Flask Routes ===
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running."
+
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running."
+@app.route("/force_webhook", methods=["GET"])
+def force_webhook():
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    if not WEBHOOK_URL:
+        return "❌ Missing WEBHOOK_URL", 500
+    try:
+        bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+        return f"✅ Webhook set to {WEBHOOK_URL}/{TOKEN}", 200
+    except Exception as e:
+        return f"❌ Failed to set webhook: {e}", 500
+
+# === Start Server + Webhook ===
 if __name__ == "__main__":
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         raise Exception("Missing WEBHOOK_URL")
-    bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")  # ✅ only once
+
+    bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
