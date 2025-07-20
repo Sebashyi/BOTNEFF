@@ -160,15 +160,14 @@ def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
-
 @app.route("/force_webhook", methods=["GET"])
 def force_webhook():
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         return "❌ Missing WEBHOOK_URL", 500
     try:
-        bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-        return f"✅ Webhook set to {WEBHOOK_URL}/{TOKEN}", 200
+        bot.set_webhook(f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}")
+        return f"✅ Webhook set to {WEBHOOK_URL.rstrip('/')}/{TOKEN}", 200
     except Exception as e:
         return f"❌ Failed to set webhook: {e}", 500
 
