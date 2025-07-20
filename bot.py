@@ -1,181 +1,195 @@
 import os
 import json
-import base64
 import logging
+import pickle
+import base64
 import re
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
-from bs4 import BeautifulSoup
 
-# Logging
-logging.basicConfig(level=logging.INFO)
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Admin ID (replace with your Telegram ID)
-ADMIN_ID = 1364549026
+# ====== CONFIGURATION =======
+ADMIN_CHAT_ID = 1364549026  # replace with your Telegram ID
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.pickle'
+USERS_FILE = 'users.json'
 
-# Load credentials from environment secret (base64-encoded JSON)
-credentials_json = os.getenv("GMAIL_CREDENTIALS")
-if not credentials_json:
-    raise Exception("Missing GMAIL_CREDENTIALS secret.")
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
-info = json.loads(credentials_json)
-creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/gmail.readonly"])
+# ============================
 
-# Gmail API service
-service = build("gmail", "v1", credentials=creds)
+# ---- Gmail Auth ----
+def get_gmail_credentials():
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'rb') as token:
+            creds = pickle.load(token)
 
-# Telegram Bot Token
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise Exception("Missing BOT_TOKEN environment variable.")
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_FILE, SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_FILE, 'wb') as token:
+            pickle.dump(creds, token)
+    return creds
 
-# User storage file
-USERS_FILE = "users.json"
+def get_gmail_service():
+    creds = get_gmail_credentials()
+    return build('gmail', 'v1', credentials=creds)
 
+# ---- User Management ----
 def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("approved", []), data.get("pending", [])
-    else:
-        return [], []
+    if not os.path.exists(USERS_FILE):
+        return {"approved": [], "pending": []}
+    with open(USERS_FILE, "r") as f:
+        return json.load(f)
 
-def save_users(approved_users, pending_users):
-    data = {"approved": approved_users, "pending": pending_users}
+def save_users(users):
     with open(USERS_FILE, "w") as f:
-        json.dump(data, f)
-
-approved_users, pending_users = load_users()
+        json.dump(users, f)
 
 def is_approved(chat_id):
-    return chat_id in approved_users
+    users = load_users()
+    return chat_id in users["approved"]
 
-def get_latest_email(user_email, query):
-    try:
-        results = service.users().messages().list(userId=user_email, q=query, maxResults=1).execute()
-        messages = results.get("messages", [])
-        if not messages:
-            return "No matching email found."
+def add_pending_user(chat_id):
+    users = load_users()
+    if chat_id not in users["pending"] and chat_id not in users["approved"]:
+        users["pending"].append(chat_id)
+        save_users(users)
+        return True
+    return False
 
-        msg = service.users().messages().get(userId=user_email, id=messages[0]["id"]).execute()
-        payload = msg.get("payload", {})
-        parts = payload.get("parts", [])
+def approve_user(chat_id):
+    users = load_users()
+    if chat_id in users["pending"]:
+        users["pending"].remove(chat_id)
+    if chat_id not in users["approved"]:
+        users["approved"].append(chat_id)
+    save_users(users)
 
-        for part in parts:
-            if part.get("mimeType") == "text/html":
-                data = part["body"]["data"]
-                decoded = base64.urlsafe_b64decode(data).decode("utf-8")
-                soup = BeautifulSoup(decoded, "html.parser")
+def get_latest_email(service, user_id='me', query='from:info@mailer.netflix.com'):
+    results = service.users().messages().list(userId=user_id, q=query, maxResults=1).execute()
+    messages = results.get('messages', [])
+    if not messages:
+        return None
 
-                if "password" in query:
-                    for link in soup.find_all("a", href=True):
-                        if "netflix.com/password" in link["href"]:
-                            return link["href"]
-                else:
-                    match = re.search(r">(\d{6})<", decoded)
-                    if match:
-                        return f"Netflix Sign-In Code: {match.group(1)}"
-        return "Matching email found but no data extracted."
+    msg = service.users().messages().get(userId=user_id, id=messages[0]['id'], format='full').execute()
+    parts = msg['payload'].get('parts', [])
+    body = ""
 
-    except Exception as e:
-        logger.error(f"Error fetching email: {e}")
-        return "Error fetching email."
+    for part in parts:
+        if part['mimeType'] == 'text/html':
+            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+            break
+    return body
 
+def extract_reset_link(body):
+    match = re.search(r'href="(https://www\.netflix\.com/[^\"]*password[^\"]*)"', body)
+    return match.group(1) if match else "Reset link not found."
+
+def extract_code(body):
+    match = re.search(r'(\d{6})', body)
+    return match.group(1) if match else "No code found."
+
+# ---- Bot Handlers ----
 def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
-    user = update.effective_user
+    user_added = add_pending_user(chat_id)
+    context.bot.send_message(chat_id, "👋 Welcome! Your ID has been sent to the admin for approval.")
+    if user_added:
+        context.bot.send_message(ADMIN_CHAT_ID, f"New user requested access:\nChat ID: {chat_id}")
 
-    if chat_id in approved_users:
-        update.message.reply_text("✅ You are already approved.")
-    elif chat_id in pending_users:
-        update.message.reply_text("⏳ Your request is pending admin approval.")
-    else:
-        pending_users.append(chat_id)
-        save_users(approved_users, pending_users)
-        update.message.reply_text("👋 Welcome! Request sent for approval. Please wait.")
-        context.bot.send_message(chat_id=ADMIN_ID, text=f"New user requested access: {chat_id} (@{user.username})")
+def get_reset(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    if not is_approved(chat_id):
+        update.message.reply_text("⛔ You are not approved yet.")
+        return
+
+    try:
+        service = get_gmail_service()
+        body = get_latest_email(service)
+        if not body:
+            update.message.reply_text("No email found.")
+            return
+
+        link = extract_reset_link(body)
+        update.message.reply_text(f"🔗 Reset link:\n{link}")
+    except Exception as e:
+        update.message.reply_text("Error fetching reset link.")
+        logger.error(e)
+
+def get_code(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    if not is_approved(chat_id):
+        update.message.reply_text("⛔ You are not approved yet.")
+        return
+
+    try:
+        service = get_gmail_service()
+        body = get_latest_email(service)
+        if not body:
+            update.message.reply_text("No email found.")
+            return
+
+        code = extract_code(body)
+        update.message.reply_text(f"🔢 Login code: {code}")
+    except Exception as e:
+        update.message.reply_text("Error fetching code.")
+        logger.error(e)
 
 def approve(update: Update, context: CallbackContext):
-    if update.effective_chat.id != ADMIN_ID:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        update.message.reply_text("⛔ Unauthorized.")
         return
-
-    if not context.args:
+    try:
+        chat_id = int(context.args[0])
+        approve_user(chat_id)
+        update.message.reply_text(f"✅ Approved user {chat_id}")
+    except:
         update.message.reply_text("Usage: /approve <chat_id>")
+
+def pending(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        update.message.reply_text("⛔ Unauthorized.")
         return
+    users = load_users()
+    update.message.reply_text(f"📌 Pending Users:\n" + "\n".join(map(str, users["pending"])))
 
-    try:
-        chat_id = int(context.args[0])
-        if chat_id not in approved_users:
-            approved_users.append(chat_id)
-        if chat_id in pending_users:
-            pending_users.remove(chat_id)
-        save_users(approved_users, pending_users)
-        context.bot.send_message(chat_id=chat_id, text="✅ You are approved to use the bot!")
-        update.message.reply_text("User approved.")
-    except ValueError:
-        update.message.reply_text("Invalid chat_id.")
-
-def revoke(update: Update, context: CallbackContext):
-    if update.effective_chat.id != ADMIN_ID:
-        return
-
-    if not context.args:
-        update.message.reply_text("Usage: /revoke <chat_id>")
-        return
-
-    try:
-        chat_id = int(context.args[0])
-        if chat_id in approved_users:
-            approved_users.remove(chat_id)
-        save_users(approved_users, pending_users)
-        context.bot.send_message(chat_id=chat_id, text="🚫 Access revoked by admin.")
-        update.message.reply_text("User revoked.")
-    except ValueError:
-        update.message.reply_text("Invalid chat_id.")
-
-def fetch(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    if not is_approved(chat_id):
-        update.message.reply_text("❌ You are not approved to use this bot.")
-        return
-
-    if not context.args:
-        update.message.reply_text("Usage: /fetch <email>")
-        return
-
-    email = context.args[0]
-    code = get_latest_email(email, "Netflix login code")
-    update.message.reply_text(code)
-
-def reset(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    if not is_approved(chat_id):
-        update.message.reply_text("❌ You are not approved to use this bot.")
-        return
-
-    if not context.args:
-        update.message.reply_text("Usage: /reset <email>")
-        return
-
-    email = context.args[0]
-    link = get_latest_email(email, "Netflix password reset")
-    update.message.reply_text(link)
-
+# ---- Main Entry ----
 def main():
+    if not BOT_TOKEN:
+        raise Exception("Missing BOT_TOKEN environment variable.")
+    if not os.path.exists(CREDENTIALS_FILE):
+        raise Exception("Missing credentials.json file.")
+    
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("approve", approve))
-    dp.add_handler(CommandHandler("revoke", revoke))
-    dp.add_handler(CommandHandler("fetch", fetch))
-    dp.add_handler(CommandHandler("reset", reset))
+    dp.add_handler(CommandHandler("getreset", get_reset))
+    dp.add_handler(CommandHandler("getcode", get_code))
+    dp.add_handler(CommandHandler("approve", approve, pass_args=True))
+    dp.add_handler(CommandHandler("pending", pending))
 
     updater.start_polling()
     updater.idle()
 
 if __name__ == '__main__':
     main()
+
