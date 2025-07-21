@@ -143,7 +143,7 @@ def get_reset(update: Update, context: CallbackContext):
     link, code = fetch_latest_email(email, "Netflix password reset", digits=6)
     update.message.reply_text(f"🔗 Reset link: {link}\n🔐 Code (if any): {code}")
 
-# === Telegram Command Routing ===
+# === Register Telegram Handlers ===
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("approve", approve))
 dispatcher.add_handler(CommandHandler("revoke", revoke))
@@ -161,26 +161,13 @@ def webhook():
     dispatcher.process_update(update)
     return "ok"
 
-@app.route("/force_webhook", methods=["GET"])
-def force_webhook():
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    if not WEBHOOK_URL:
-        return "❌ Missing WEBHOOK_URL", 500
-    try:
-        bot.set_webhook(f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}")
-        return f"✅ Webhook set to {WEBHOOK_URL.rstrip('/')}/{TOKEN}", 200
-    except Exception as e:
-        return f"❌ Failed to set webhook: {e}", 500
-
 # === Start Server + Webhook ===
 if __name__ == "__main__":
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         raise Exception("Missing WEBHOOK_URL")
 
-    # 🔧 Sets webhook URL exactly once
-    full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}"
-    print(f"🔗 Setting webhook to: {full_webhook_url}")
-    bot.set_webhook(full_webhook_url)
-
-   
+    # Set webhook only once at startup
+    full_url = f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}"
+    bot.set_webhook(full_url)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
