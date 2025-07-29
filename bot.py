@@ -160,14 +160,13 @@ def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
-
 # === Start Server + Webhook ===
 if __name__ == "__main__":
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not WEBHOOK_URL:
         raise Exception("Missing WEBHOOK_URL")
 
-    # Set webhook only once at startup
     full_url = f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}"
     bot.set_webhook(full_url)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
