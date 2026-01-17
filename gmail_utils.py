@@ -1,4 +1,3 @@
-
 import os
 import json
 import base64
@@ -17,38 +16,37 @@ def get_service():
     Create a Gmail API service.
 
     Priority:
-    1. Use /etc/secrets/GMAIL_CREDENTIALS (for Render – JSON with credentials)
-    2. Fallback to local token.json (for local testing)
+    1. Railway ENV var: GMAIL_CREDENTIALS (JSON string)
+    2. Local token.json (for local testing only)
     """
     creds = None
 
-    # 1) Render / server secret
-    if os.path.exists("/etc/secrets/GMAIL_CREDENTIALS"):
-        with open("/etc/secrets/GMAIL_CREDENTIALS", "r") as f:
-            creds_dict = json.load(f)
-        creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+    # ✅ 1) Railway / env-based credentials
+    env_creds = os.getenv("GMAIL_CREDENTIALS")
+    if env_creds:
+        try:
+            creds_dict = json.loads(env_creds)
+            creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+        except Exception as e:
+            raise Exception(f"Invalid GMAIL_CREDENTIALS JSON: {e}")
 
-    # 2) Local token.json (for development)
+    # ✅ 2) Local development fallback
     elif os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    if not creds:
+        raise Exception("No Gmail credentials found (env or token.json missing)")
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            raise Exception(
-                "No valid Gmail credentials found. "
-                "Ensure /etc/secrets/GMAIL_CREDENTIALS or token.json exists."
-            )
+            raise Exception("Gmail credentials expired and cannot be refreshed")
 
     return build("gmail", "v1", credentials=creds)
 
 
 def _extract_netflix_content_from_body(msg_body: str, digits: int = 4):
-    """
-    Extract Netflix-related link + code from plain text body.
-    digits = expected code length (4 or 6).
-    """
     links = re.findall(r'https://www\.netflix\.com/[^\s"<]+', msg_body)
     codes = re.findall(rf'(?<!\d)(\d{{{digits}}})(?!\d)', msg_body)
 
@@ -58,15 +56,6 @@ def _extract_netflix_content_from_body(msg_body: str, digits: int = 4):
 
 
 def fetch_latest_email(email: str, query: str, digits: int = 4):
-    """
-    Generic helper:
-    - email: the target email address (Netflix account email)
-    - query: Gmail search query (e.g. 'Netflix', 'Netflix password reset')
-    - digits: code length to look for (4 or 6)
-
-    Returns:
-      (link, code) -> both strings
-    """
     service = get_service()
 
     full_query = f'to:{email} {query}'
@@ -89,52 +78,43 @@ def fetch_latest_email(email: str, query: str, digits: int = 4):
 
     body = ""
 
-    # Try text/plain first
     if 'parts' in payload:
         for part in payload['parts']:
-            mime = part.get('mimeType', '')
-            data = part.get('body', {}).get('data')
-            if mime == 'text/plain' and data:
-                body = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+            if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
+                body = base64.urlsafe_b64decode(
+                    part['body']['data']
+                ).decode('utf-8', errors='ignore')
                 break
 
-        # If still empty, try HTML → text
         if not body:
             for part in payload['parts']:
-                mime = part.get('mimeType', '')
-                data = part.get('body', {}).get('data')
-                if mime == 'text/html' and data:
-                    html = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                if part.get('mimeType') == 'text/html' and 'data' in part.get('body', {}):
+                    html = base64.urlsafe_b64decode(
+                        part['body']['data']
+                    ).decode('utf-8', errors='ignore')
                     soup = BeautifulSoup(html, 'html.parser')
                     body = soup.get_text(separator=' ', strip=True)
                     break
 
-    # Fallback: single-part
     if not body and 'body' in payload and 'data' in payload['body']:
-        data = payload['body']['data']
-        body = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+        body = base64.urlsafe_b64decode(
+            payload['body']['data']
+        ).decode('utf-8', errors='ignore')
 
     if not body:
         return "No body found", "N/A"
 
-    return _extract_netflix_content_from_body(body, digits=digits)
+    return _extract_netflix_content_from_body(body, digits)
 
 
 def fetch_latest_netflix_code(email: str):
-    """
-    Use the generic fetcher to get latest Netflix login code for a given email.
-    """
-    link, code = fetch_latest_email(email, query='Netflix', digits=4)
-    if code == "No code found":
-        return "Netflix Login Code: Code not found."
+    link, code = fetch_latest_email(email, "Netflix", digits=4)
     return f"Netflix Login Code: {code}"
 
 
 def fetch_latest_reset_link(email: str):
-    """
-    Use HTML parsing to get latest Netflix password reset link for a given email.
-    """
     service = get_service()
+
     full_query = f'to:{email} from:info@account.netflix.com subject:"reset your password"'
     result = service.users().messages().list(
         userId='me',
@@ -153,28 +133,19 @@ def fetch_latest_reset_link(email: str):
     ).execute()
     payload = msg.get('payload', {})
 
-    parts = payload.get('parts', [])
-    html_part = None
-    for p in parts:
-        if p.get('mimeType') == 'text/html' and 'data' in p.get('body', {}):
-            html_part = p
-            break
+    for part in payload.get('parts', []):
+        if part.get('mimeType') == 'text/html' and 'data' in part.get('body', {}):
+            html = base64.urlsafe_b64decode(
+                part['body']['data']
+            ).decode('utf-8', errors='ignore')
+            soup = BeautifulSoup(html, 'html.parser')
 
-    if not html_part and 'body' in payload and 'data' in payload['body']:
-        html_data = payload['body']['data']
-    elif html_part:
-        html_data = html_part['body']['data']
-    else:
-        return "No HTML part found."
+            link_tag = soup.find('a', href=re.compile(r'netflix\.com/password'))
+            if not link_tag:
+                link_tag = soup.find('a', href=re.compile(r'netflix\.com'))
 
-    html = base64.urlsafe_b64decode(html_data).decode('utf-8', errors='ignore')
-    soup = BeautifulSoup(html, 'html.parser')
-
-    link_tag = soup.find('a', href=re.compile(r'netflix\.com/password'))
-    if not link_tag:
-        link_tag = soup.find('a', href=re.compile(r'netflix\.com'))
-
-    if link_tag:
-        return f"Reset Link: {link_tag['href']}"
+            if link_tag:
+                return f"Reset Link: {link_tag['href']}"
 
     return "Reset link not found."
+
